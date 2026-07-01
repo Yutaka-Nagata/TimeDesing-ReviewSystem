@@ -14,6 +14,7 @@ const IDEAL_LIFE = readFileSync(join(__dirname, 'ideal-life.md'), 'utf-8');
 
 function getDateStr(daysAgo) {
   const d = new Date();
+  d.setTime(d.getTime() + 9 * 60 * 60 * 1000); // UTC→JST
   d.setDate(d.getDate() - daysAgo);
   return d.toISOString().split('T')[0];
 }
