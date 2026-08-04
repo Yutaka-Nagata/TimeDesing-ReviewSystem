@@ -128,6 +128,55 @@ function buildSleepSection(targetDate, blocks) {
   return s;
 }
 
+// 直近4日から「崩れ始め」を検知する。DSPSでは自力復元が効かないため、
+// 大きく崩れてからではなく後退の初期段階で警告を出すことを目的とする。
+function buildSleepAlert(targetDate, blocks) {
+  const days = [];
+  for (let k = 3; k >= 0; k--) {
+    const date = shiftDate(targetDate, -k);
+    const woke = blocks.filter(b => b.end.date === date);
+    days.push({ date, main: woke.reduce((a, b) => (!a || b.minutes > a.minutes ? b : a), null) });
+  }
+
+  // 就寝時刻を「前日18時からの経過分」に正規化して日ごとの増減を取る
+  const offsets = days.map(d => (d.main ? d.main.startAbs - ((dayIndex(d.date) - 1) * 1440 + 18 * 60) : null));
+  const drifts = [];
+  for (let i = 1; i < offsets.length; i++) {
+    drifts.push(offsets[i] !== null && offsets[i - 1] !== null ? offsets[i] - offsets[i - 1] : null);
+  }
+
+  const alerts = [];
+  const last3 = drifts.slice(-3);
+  if (last3.length === 3 && last3.every(d => d !== null && d > 0)) {
+    const total = last3.reduce((a, b) => a + b, 0);
+    alerts.push(
+      `⚠️ 位相ドリフト警告：3日連続で就寝が後退している（合計 ${formatDuration(total)}）。` +
+        `本人はDSPSの診断を受けており、健常者と違って放置しても自然には戻らない。` +
+        `「気をつけよう」ではなく、今日中に起床時刻を固定するという具体的な一手を書くこと。`
+    );
+  }
+
+  const lastTwo = days.slice(-2).map(d => d.main);
+  if (lastTwo.length === 2 && lastTwo.every(m => m && m.endAbs % 1440 >= 12 * 60)) {
+    alerts.push(
+      `🚨 復旧プロトコル発火：起床が正午以降の日が2日続いた。` +
+        `通常の改善フィードバックは書かず、「理想の生活」の復旧プロトコルの手順をそのまま提示することを最優先にする。` +
+        `理想との差分を並べて責めない。崩れている最中の本人は気力が落ちているので、ハードルを下げる方向で書く。`
+    );
+  }
+
+  const lastDrift = drifts[drifts.length - 1];
+  if (lastDrift !== null && lastDrift <= -30) {
+    alerts.push(
+      `✅ 前進：前日より就寝が ${formatDuration(-lastDrift)} 前倒しできている。` +
+        `この事実をレビューの冒頭ではっきり褒めること。理想（22時就寝）との差分には触れない。` +
+        `本人は前進を「目標未達」として記録してしまう癖があるため、ここを正しく勝ちとして扱うこと自体が重要。`
+    );
+  }
+
+  return alerts.length ? `# 睡眠アラート（最優先で扱うこと）\n${alerts.map(a => `- ${a}`).join('\n')}\n\n` : '';
+}
+
 // 週次用：就寝・起床の位相ドリフトをテキストチャートで可視化する。
 // 横軸は「前日18時 → 当日18時」の24時間窓。ブロックが右にずれていくほど夜型に流れている。
 function buildSleepTrend(fromDate, toDate, blocks) {
@@ -232,11 +281,11 @@ function formatTasks(tasks, withDate = false) {
     .join('\n');
 }
 
-async function buildReviewPrompt(yesterday, tasks, sleepSection, weekTasks = null, monthTasks = null, sleepTrend = null) {
+async function buildReviewPrompt(yesterday, tasks, sleepSection, weekTasks = null, monthTasks = null, sleepTrend = null, sleepAlert = '') {
   let prompt = `あなたはユーザーの生活習慣をレビューするアシスタントです。
 以下の「理想の生活」と「実際の記録」を比較し、日本語でレビューを作成してください。
 
-# 理想の生活
+${sleepAlert}# 理想の生活
 ${IDEAL_LIFE}
 
 ---
@@ -357,9 +406,12 @@ const todayStr = shiftDate(yesterday, 1);
 console.log(`レビュー対象: ${yesterday}${DRY_RUN ? '（dry-run）' : ''}`);
 
 // 睡眠は日をまたぐため、前後の日も含めて取得してから対象日を切り出す
-const windowTasks = await fetchTasks(shiftDate(yesterday, -2), todayStr);
+// 崩れ検知に4日分の睡眠が要るため、余裕を持って5日前から取得する
+const windowTasks = await fetchTasks(shiftDate(yesterday, -5), todayStr);
 const tasks = windowTasks.filter(t => t.date === yesterday);
-const sleepSection = buildSleepSection(yesterday, toSleepBlocks(windowTasks));
+const blocks = toSleepBlocks(windowTasks);
+const sleepSection = buildSleepSection(yesterday, blocks);
+const sleepAlert = buildSleepAlert(yesterday, blocks);
 
 let weekTasks = null;
 let monthTasks = null;
@@ -377,7 +429,7 @@ if (isFirstSundayOfMonth(todayStr)) {
   monthTasks = await fetchTasks(shiftDate(yesterday, -29), yesterday);
 }
 
-const prompt = await buildReviewPrompt(yesterday, tasks, sleepSection, weekTasks, monthTasks, sleepTrend);
+const prompt = await buildReviewPrompt(yesterday, tasks, sleepSection, weekTasks, monthTasks, sleepTrend, sleepAlert);
 
 if (DRY_RUN) {
   console.log('\n--- プロンプト ---\n' + prompt);
