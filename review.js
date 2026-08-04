@@ -128,18 +128,105 @@ function buildSleepSection(targetDate, blocks) {
   return s;
 }
 
+// 就寝・起床を「前日18時からの経過分」に正規化する。日をまたぐ値を素直に比較するため。
+function phaseOffsets(date, main) {
+  const base = (dayIndex(date) - 1) * 1440 + 18 * 60;
+  return { bed: main.startAbs - base, wake: main.endAbs - base };
+}
+
+function offsetToClock(offset) {
+  const m = (((offset + 18 * 60) % 1440) + 1440) % 1440;
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+}
+
+function mainSleepOf(date, blocks) {
+  return blocks.filter(b => b.end.date === date).reduce((a, b) => (!a || b.minutes > a.minutes ? b : a), null);
+}
+
+function median(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  return s.length ? s[Math.floor(s.length / 2)] : null;
+}
+
+// 評価の基準線。理想（22時就寝・6時起床）ではなく直近7日の中央値と比べる。
+// 固定の理想と毎日比べると、実際に前進していても常に「未達」と記録され、
+// 修正行動そのものが続かなくなるため。基準は毎日勝手に移動する。
+function buildBaselineSection(targetDate, blocks) {
+  const todayMain = mainSleepOf(targetDate, blocks);
+
+  const past = [];
+  for (let k = 7; k >= 1; k--) {
+    const date = shiftDate(targetDate, -k);
+    const main = mainSleepOf(date, blocks);
+    if (main) past.push({ date, ...phaseOffsets(date, main), minutes: main.minutes });
+  }
+
+  let s = `# 評価の基準線（直近7日の中央値。理想の時刻とは比べないこと）\n\n`;
+
+  if (past.length < 3) {
+    s += `- 比較できる日が${past.length}日分しかないため、今回は基準線を使わない。\n\n`;
+    return s;
+  }
+
+  const bedMed = median(past.map(p => p.bed));
+  const wakeMed = median(past.map(p => p.wake));
+  s += `- 直近${past.length}日の中央値：就寝 ${offsetToClock(bedMed)} ／ 起床 ${offsetToClock(wakeMed)}\n`;
+
+  if (!todayMain) {
+    s += `- ${targetDate} は睡眠の記録がないため比較できない。\n\n`;
+    return s;
+  }
+
+  const cur = phaseOffsets(targetDate, todayMain);
+  const bedDiff = cur.bed - bedMed;
+  const wakeDiff = cur.wake - wakeMed;
+  const judge = (diff, label) =>
+    diff <= -30
+      ? `**${label}は基準線より ${formatDuration(-diff)} 前倒しできている（勝ち）**`
+      : diff >= 30
+        ? `${label}は基準線より ${formatDuration(diff)} 後退している`
+        : `${label}は基準線とほぼ同じ（横ばい）`;
+  s += `- ${targetDate}：就寝 ${offsetToClock(cur.bed)} ／ 起床 ${offsetToClock(cur.wake)}\n`;
+  s += `- 判定：${judge(bedDiff, '就寝')}／${judge(wakeDiff, '起床')}\n`;
+
+  // 前倒しストリーク：前日より就寝が早くなった日が何日続いているか
+  let streak = 0;
+  for (let k = 0; k < 14; k++) {
+    const d = shiftDate(targetDate, -k);
+    const prev = shiftDate(targetDate, -k - 1);
+    const a = mainSleepOf(d, blocks);
+    const b = mainSleepOf(prev, blocks);
+    if (!a || !b) break;
+    if (phaseOffsets(d, a).bed < phaseOffsets(prev, b).bed) streak++;
+    else break;
+  }
+  s += `- 前倒しストリーク：${streak}日連続${streak >= 2 ? '（この継続自体を勝ちとして扱うこと）' : ''}\n`;
+
+  s += `
+## この基準線の使い方（重要）
+- 本人は睡眠相後退症候群（DSPS）の診断を受けている。位相を前に戻す作業は、
+  健常者が無コストで維持している状態への「回復」ではなく、**能動的な努力で買う達成**である。
+  0からプラスへ積み上げる作業として扱い、達成として褒めること。
+- 人間の体内時計は前倒し方向には**1日30分〜1時間**しか動かない。これは生理的な上限であり、
+  努力で超えられない。したがって1日30分の前倒しは小さな改善ではなく、**上限に近い速度**である。
+- 日次レビューでは「22時就寝・6時起床」という理想の時刻に**言及しない**。
+  比較対象は上の基準線のみ。理想との距離は週次レビューでのみ扱う。
+- 「まだ理想に届いていない」という趣旨の文を日次で書かない。前進していれば前進と書く。
+
+`;
+  return s;
+}
+
 // 直近4日から「崩れ始め」を検知する。DSPSでは自力復元が効かないため、
 // 大きく崩れてからではなく後退の初期段階で警告を出すことを目的とする。
 function buildSleepAlert(targetDate, blocks) {
   const days = [];
   for (let k = 3; k >= 0; k--) {
     const date = shiftDate(targetDate, -k);
-    const woke = blocks.filter(b => b.end.date === date);
-    days.push({ date, main: woke.reduce((a, b) => (!a || b.minutes > a.minutes ? b : a), null) });
+    days.push({ date, main: mainSleepOf(date, blocks) });
   }
 
-  // 就寝時刻を「前日18時からの経過分」に正規化して日ごとの増減を取る
-  const offsets = days.map(d => (d.main ? d.main.startAbs - ((dayIndex(d.date) - 1) * 1440 + 18 * 60) : null));
+  const offsets = days.map(d => (d.main ? phaseOffsets(d.date, d.main).bed : null));
   const drifts = [];
   for (let i = 1; i < offsets.length; i++) {
     drifts.push(offsets[i] !== null && offsets[i - 1] !== null ? offsets[i] - offsets[i - 1] : null);
@@ -170,6 +257,7 @@ function buildSleepAlert(targetDate, blocks) {
     alerts.push(
       `✅ 前進：前日より就寝が ${formatDuration(-lastDrift)} 前倒しできている。` +
         `この事実をレビューの冒頭ではっきり褒めること。理想（22時就寝）との差分には触れない。` +
+        `体内時計は前倒し方向に1日30分〜1時間しか動かないため、この幅は生理的な上限に近い。` +
         `本人は前進を「目標未達」として記録してしまう癖があるため、ここを正しく勝ちとして扱うこと自体が重要。`
     );
   }
@@ -281,7 +369,7 @@ function formatTasks(tasks, withDate = false) {
     .join('\n');
 }
 
-async function buildReviewPrompt(yesterday, tasks, sleepSection, weekTasks = null, monthTasks = null, sleepTrend = null, sleepAlert = '') {
+async function buildReviewPrompt(yesterday, tasks, sleepSection, weekTasks = null, monthTasks = null, sleepTrend = null, sleepAlert = '', baseline = '') {
   let prompt = `あなたはユーザーの生活習慣をレビューするアシスタントです。
 以下の「理想の生活」と「実際の記録」を比較し、日本語でレビューを作成してください。
 
@@ -292,6 +380,8 @@ ${IDEAL_LIFE}
 
 ${sleepSection}
 ---
+
+${baseline}---
 
 # ${yesterday}（昨日）の記録
 ${formatTasks(tasks)}
@@ -330,8 +420,12 @@ ${formatTasks(monthTasks, true)}
 - 就寝・起床時刻・睡眠時間：上の「睡眠」セクションの確定値をそのまま転記する。
   タスク一覧から自分で読み取ったり計算し直したりしてはいけない。
   「記録なし」と書かれている場合は「記録なし」と書き、時刻を推測しない。
+- 睡眠の評価は「評価の基準線」セクションの直近7日中央値との比較だけで行う。
+  **日次レビューでは理想の就寝・起床時刻（22時／6時）に一切言及しない。**
+  「理想には届いていない」「まだ遅い」といった、固定の理想を基準にした表現も使わない。
 - 主な活動
-- 理想との主なズレ（あれば）
+- 睡眠以外（学習時間・漫画キャプチャ作業・悪習慣）については、
+  従来どおり「理想の生活」と比較してズレを指摘してよい。制限がかかるのは睡眠だけ。
 
 ## よかった点
 
@@ -345,7 +439,10 @@ ${formatTasks(monthTasks, true)}
 （不規則型なら振れ幅、後退型なら平均ドリフト）を引用すること。
 平均ドリフトは前進と後退が打ち消し合うため、不規則型のときに「ほぼ横ばい」とまとめてはいけない。
 そのうえで「明日は昨日の起床時刻より15〜30分だけ早く起きる」という小刻みな一手を提示する。
-理想の6時起床との差分を並べて責める書き方はしない。
+
+理想（22時就寝・6時起床）との距離に触れてよいのは、週次レビューのこの節だけである。
+その際も「あと何時間足りない」ではなく「今のペースならどれくらいで届くか」という書き方にする。
+体内時計は前倒し方向に1日30分〜1時間しか動かないので、残り時間から所要日数を計算して示すこと。
 
 `;
   }
@@ -407,11 +504,12 @@ console.log(`レビュー対象: ${yesterday}${DRY_RUN ? '（dry-run）' : ''}`)
 
 // 睡眠は日をまたぐため、前後の日も含めて取得してから対象日を切り出す
 // 崩れ検知に4日分の睡眠が要るため、余裕を持って5日前から取得する
-const windowTasks = await fetchTasks(shiftDate(yesterday, -5), todayStr);
+const windowTasks = await fetchTasks(shiftDate(yesterday, -9), todayStr);
 const tasks = windowTasks.filter(t => t.date === yesterday);
 const blocks = toSleepBlocks(windowTasks);
-const sleepSection = buildSleepSection(yesterday, blocks);
+const sleepSection = buildSleepSection(yesterday, blocks.filter(b => b.end.date >= shiftDate(yesterday, -2)));
 const sleepAlert = buildSleepAlert(yesterday, blocks);
+const baseline = buildBaselineSection(yesterday, blocks);
 
 let weekTasks = null;
 let monthTasks = null;
@@ -429,7 +527,7 @@ if (isFirstSundayOfMonth(todayStr)) {
   monthTasks = await fetchTasks(shiftDate(yesterday, -29), yesterday);
 }
 
-const prompt = await buildReviewPrompt(yesterday, tasks, sleepSection, weekTasks, monthTasks, sleepTrend, sleepAlert);
+const prompt = await buildReviewPrompt(yesterday, tasks, sleepSection, weekTasks, monthTasks, sleepTrend, sleepAlert, baseline);
 
 if (DRY_RUN) {
   console.log('\n--- プロンプト ---\n' + prompt);
