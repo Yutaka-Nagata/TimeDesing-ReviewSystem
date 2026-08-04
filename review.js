@@ -217,6 +217,69 @@ function buildBaselineSection(targetDate, blocks) {
   return s;
 }
 
+// 週末レビュー用：荒療治（睡眠を削って強制起床し、その夜に早寝する）を薦めるかを判定する。
+// 「理想との差が大きいこと」だけを条件にすると、差が大きい時期は毎週発火して連投になり
+// かえって壊れるため、「差が大きい」かつ「先週から改善が止まっている」ときだけ発火させる。
+function buildHarshResetCheck(targetDate, blocks) {
+  const IDEAL_WAKE = 12 * 60; // 6:00 を「前日18時からの経過分」で表した値
+
+  const medianWake = (fromK, toK) => {
+    const vals = [];
+    for (let k = fromK; k >= toK; k--) {
+      const date = shiftDate(targetDate, -k);
+      const main = mainSleepOf(date, blocks);
+      if (main) vals.push(phaseOffsets(date, main).wake);
+    }
+    return { med: median(vals), n: vals.length };
+  };
+
+  const thisWeek = medianWake(6, 0);
+  const lastWeek = medianWake(13, 7);
+
+  let s = `# 荒療治の判定（週末レビューでのみ扱う）\n\n`;
+  if (thisWeek.n < 4) {
+    s += `- 今週の睡眠記録が${thisWeek.n}日分しかないため判定しない。\n\n`;
+    return s;
+  }
+
+  const gap = thisWeek.med - IDEAL_WAKE;
+  s += `- 今週の起床中央値：${offsetToClock(thisWeek.med)}（理想の6:00との差 ${formatDuration(Math.abs(gap))}）\n`;
+
+  let improvement = null;
+  if (lastWeek.n >= 4) {
+    improvement = lastWeek.med - thisWeek.med; // プラスなら前倒しできている
+    s += `- 先週の起床中央値：${offsetToClock(lastWeek.med)}（前週比 ${improvement >= 0 ? '−' : '＋'}${formatDuration(Math.abs(improvement))}${improvement >= 0 ? '＝前倒し' : '＝後退'}）\n`;
+  } else {
+    s += `- 先週は記録が${lastWeek.n}日分しかなく、前週比を出せない。\n`;
+  }
+
+  // 犠牲日（睡眠5時間以下）が直近14日にあれば、荒療治を最近実施した可能性が高いとみなす
+  const recentHarsh = blocks.some(
+    b => b.minutes <= 300 && b.end.date > shiftDate(targetDate, -14) && b.end.date <= targetDate
+  );
+
+  const reasons = [];
+  if (gap < 120) reasons.push('理想との差が2時間未満（射程内なので通常運用で詰める）');
+  if (improvement !== null && improvement >= 30) reasons.push(`前週から${formatDuration(improvement)}前倒しできている（効いている手を邪魔しない）`);
+  if (recentHarsh) reasons.push('直近14日に睡眠5時間以下の日があり、荒療治を実施済みの可能性が高い（連投は禁止）');
+
+  if (reasons.length) {
+    s += `- 判定：**見送り**。理由：${reasons.join(' / ')}\n`;
+    s += `- 荒療治には一切触れないこと。通常の週次レビューを書く。\n\n`;
+    return s;
+  }
+
+  s += `- 判定：**荒療治を提案する**\n`;
+  s += `  - 理想との差が${formatDuration(gap)}あり、かつ前週から改善が止まっている（連投の形跡もない）。
+  - 「理想の生活」の復旧プロトコルを、今週末の日程に当てはめて提示すること。
+  - **土曜を犠牲日、日曜をリバウンド日**として具体的な時刻入りで書く。
+    土曜：固定時刻に強制起床 → 即・屋外で30分 → 昼寝禁止 → 学習ノルマは半分 → 22:00就寝
+    日曜：8:00にアラーム。10:00までに起きられれば成功。
+  - 「使い物にならない土曜」を前提に書き、罪悪感を持たせない。
+  - 強制するのではなく提案する。本人が今週はやらないと決めてもよいことを明記する。\n\n`;
+  return s;
+}
+
 // 直近4日から「崩れ始め」を検知する。DSPSでは自力復元が効かないため、
 // 大きく崩れてからではなく後退の初期段階で警告を出すことを目的とする。
 function buildSleepAlert(targetDate, blocks) {
@@ -332,13 +395,15 @@ function buildSleepTrend(fromDate, toDate, blocks) {
   return s;
 }
 
-function isFirstSundayOfMonth(date) {
+// 週次レビューは土曜朝に送る。荒療治には犠牲日とリバウンド日で2日必要なため、
+// 土曜（犠牲日）と日曜（リバウンド日）を使えるよう、金曜までの実績を土曜朝に届ける。
+function isFirstSaturdayOfMonth(date) {
   const d = new Date(date);
-  return d.getDay() === 0 && d.getDate() <= 7;
+  return d.getDay() === 6 && d.getDate() <= 7;
 }
 
-function isSunday(date) {
-  return new Date(date).getDay() === 0;
+function isSaturday(date) {
+  return new Date(date).getDay() === 6;
 }
 
 async function fetchTasks(dateFrom, dateTo) {
@@ -516,14 +581,15 @@ let monthTasks = null;
 
 let sleepTrend = null;
 
-if (isSunday(todayStr)) {
-  // 週の初日の睡眠は前日夜に始まっているため、1日多めに取ってブロックを組む
+if (isSaturday(todayStr)) {
+  // 荒療治の判定に前週との比較が要るため、2週間分の睡眠ブロックを組む
   const weekFrom = shiftDate(yesterday, -6);
-  const weekWindow = await fetchTasks(shiftDate(weekFrom, -1), yesterday);
+  const weekWindow = await fetchTasks(shiftDate(yesterday, -15), yesterday);
   weekTasks = weekWindow.filter(t => t.date >= weekFrom);
-  sleepTrend = buildSleepTrend(weekFrom, yesterday, toSleepBlocks(weekWindow));
+  const weekBlocks = toSleepBlocks(weekWindow);
+  sleepTrend = buildSleepTrend(weekFrom, yesterday, weekBlocks) + '\n' + buildHarshResetCheck(yesterday, weekBlocks);
 }
-if (isFirstSundayOfMonth(todayStr)) {
+if (isFirstSaturdayOfMonth(todayStr)) {
   monthTasks = await fetchTasks(shiftDate(yesterday, -29), yesterday);
 }
 
@@ -536,8 +602,8 @@ if (DRY_RUN) {
 
 const review = await analyzeWithClaude(prompt);
 
-const isWeekly = isSunday(todayStr);
-const isMonthly = isFirstSundayOfMonth(todayStr);
+const isWeekly = isSaturday(todayStr);
+const isMonthly = isFirstSaturdayOfMonth(todayStr);
 const subject = isMonthly
   ? `📅 月次レビュー ${yesterday}`
   : isWeekly
